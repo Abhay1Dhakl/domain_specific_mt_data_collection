@@ -1,5 +1,5 @@
+import csv
 import re
-import pandas as pd
 from pathlib import Path
 
 
@@ -7,63 +7,263 @@ SENTENCE_CANDIDATES_PATH = Path("data/sentences/sentence_candidates.csv")
 ALIGNED_OUTPUT_PATH = Path("data/aligned/sentence_pairs_raw.csv")
 MANUAL_REVIEW_OUTPUT_PATH = Path("data/aligned/manual_review_template.csv")
 ALIGNMENT_LOG_PATH = Path("data/logs/alignment_log.csv")
+FIGURE_LABEL_PATTERNS = [
+    "retinal blood vessels",
+    "back of eye",
+    "front of eye",
+]
+
+INPUT_FIELDNAMES = [
+    "global_sentence_id",
+    "source_id",
+    "title",
+    "subdomain",
+    "paragraph_id",
+    "local_sentence_id",
+    "language",
+    "sentence",
+]
+
+ALIGNED_FIELDNAMES = [
+    "pair_id",
+    "source_id",
+    "title",
+    "subdomain",
+    "en_sentence_id",
+    "ne_sentence_id",
+    "en_paragraph_id",
+    "ne_paragraph_id",
+    "en",
+    "ne",
+    "en_chars",
+    "ne_chars",
+    "length_ratio_ne_en",
+    "length_ratio_status",
+    "alignment_method",
+    "quality_label",
+    "review_status",
+]
+
+MANUAL_REVIEW_FIELDNAMES = [
+    "pair_id",
+    "source_id",
+    "title",
+    "subdomain",
+    "en",
+    "ne",
+    "quality_label",
+    "length_ratio_status",
+    "review_status",
+    "corrected_en",
+    "corrected_ne",
+    "review_notes",
+]
+
+LOG_FIELDNAMES = [
+    "source_id",
+    "title",
+    "subdomain",
+    "num_en_sentences",
+    "num_ne_sentences",
+    "num_aligned_pairs",
+    "num_unmatched_en",
+    "num_unmatched_ne",
+    "num_run_pairs",
+    "alignment_status",
+]
+
+
+def read_csv_rows(path: Path) -> list[dict]:
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        return list(csv.DictReader(handle))
+
+
+def write_csv_rows(path: Path, fieldnames: list[str], rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def natural_sentence_id(value: str) -> int:
+    match = re.search(r"(\d+)$", str(value))
+    return int(match.group(1)) if match else 0
+
+
+def count_devanagari(text: str) -> int:
+    return len(re.findall(r"[\u0900-\u097F]", text))
+
+
+def count_latin(text: str) -> int:
+    return len(re.findall(r"[A-Za-z]", text))
 
 
 def clean_for_alignment(text: str) -> str:
-    text = str(text).strip()
+    text = str(text).replace("Ì", "")
+    text = text.replace("�", "")
+    text = re.sub(r"[\uE000-\uF8FF]", "", text)
+    text = re.sub(r"([।.!?])(?=[^\s])", r"\1 ", text)
+    text = text.strip()
     text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"•\s+", "• ", text)
     return text
 
 
+def strip_header_prefixes(text: str, title: str) -> str:
+    text = clean_for_alignment(text)
+    title_pattern = re.escape(title)
+
+    patterns = [
+        rf"^\d+\s+{title_pattern}\.?\s+Nepali\.?\s*",
+        rf"^{title_pattern}\.?\s+Nepali\.?\s*",
+        r"^\d+\s+healthinfotranslations\.org\s*",
+        r"^healthinfotranslations\.org\s*",
+        r"^Nepali\.?\s*",
+    ]
+
+    for pattern in patterns:
+        text = re.sub(pattern, "", text, flags=re.IGNORECASE).strip()
+
+    return clean_for_alignment(text)
+
+
 def is_too_short(text: str, lang: str) -> bool:
-    text = str(text).strip()
+    text = clean_for_alignment(text)
 
-    if lang == "en":
-        return len(text.split()) < 2
-
-    if lang == "ne":
-        # Nepali word split by spaces
-        return len(text.split()) < 2
+    if lang in {"en", "ne"}:
+        return len(text.replace("•", " ").split()) < 2
 
     return len(text) < 3
 
 
 def is_heading_like(text: str) -> bool:
-    """
-    Detects headings or very short labels.
-    We do not remove them completely, but we mark them as low confidence.
-    """
-    text = str(text).strip()
+    text = clean_for_alignment(text)
 
-    if len(text) <= 40 and not re.search(r"[।.!?]$", text):
+    if text.startswith("•"):
+        return False
+
+    if len(text.split()) <= 8 and not re.search(r"[।.!?:]$", text):
+        return True
+
+    return False
+
+
+def is_alignment_noise(text: str, lang: str, title: str) -> bool:
+    text = strip_header_prefixes(text, title)
+    lower = text.lower()
+    word_count = len(text.replace("•", " ").split())
+
+    if not text:
+        return True
+
+    if re.fullmatch(r"\d+", text):
+        return True
+
+    if lower in {title.lower(), f"{title.lower()}.", "nepali."}:
+        return True
+
+    if "healthinfotranslations.org" in lower:
+        return True
+
+    if any(pattern in lower for pattern in FIGURE_LABEL_PATTERNS):
+        return True
+
+    if any(
+        phrase in lower
+        for phrase in [
+            "copyright",
+            "unless otherwise stated",
+            "the medical information found on this website",
+            "you should always seek the advice of your doctor",
+            "the ohio state university",
+            "wexner medical center",
+            "mount carmel health system",
+            "ohiohealth",
+            "nationwide children",
+        ]
+    ):
+        return True
+
+    if word_count <= 12 and not text.startswith("•") and not re.search(r"[।.!?:]$", text):
+        return True
+
+    if lang == "en" and count_latin(text) < 3:
+        return True
+
+    if lang == "ne" and count_devanagari(text) < 3:
         return True
 
     return False
 
 
 def length_ratio_flag(en: str, ne: str) -> tuple[float, str]:
-    """
-    Rough length-ratio check.
-    Nepali and English character lengths do not match perfectly,
-    but extreme ratios usually indicate bad alignment.
-    """
     en_len = max(len(en), 1)
     ne_len = max(len(ne), 1)
-
     ratio = ne_len / en_len
 
     if 0.35 <= ratio <= 3.0:
         return ratio, "ok"
-    elif 0.20 <= ratio < 0.35 or 3.0 < ratio <= 4.5:
+    if 0.20 <= ratio < 0.35 or 3.0 < ratio <= 4.5:
         return ratio, "warning"
+    return ratio, "bad"
+
+
+def digit_signature(text: str) -> tuple[str, ...]:
+    normalized = str(text).translate(str.maketrans("०१२३४५६७८९", "0123456789"))
+    return tuple(re.findall(r"\d+(?:\.\d+)?", normalized))
+
+
+def is_bullet_like(text: str) -> bool:
+    text = clean_for_alignment(text)
+    return text.startswith("•") or bool(re.match(r"^\d+\.", text))
+
+
+def pair_score(en_text: str, ne_text: str) -> float:
+    ratio, ratio_status = length_ratio_flag(en_text, ne_text)
+    score_map = {
+        "ok": 4.0,
+        "warning": 1.5,
+        "bad": -3.0,
+    }
+
+    score = score_map[ratio_status]
+
+    if is_bullet_like(en_text) == is_bullet_like(ne_text):
+        score += 0.75
     else:
-        return ratio, "bad"
+        score -= 0.5
+
+    if digit_signature(en_text) and digit_signature(en_text) == digit_signature(ne_text):
+        score += 0.75
+
+    if is_heading_like(en_text) or is_heading_like(ne_text):
+        score -= 1.0
+
+    if is_too_short(en_text, "en") or is_too_short(ne_text, "ne"):
+        score -= 1.5
+
+    if len(en_text) > 0:
+        score -= abs(1.0 - ratio) * 0.25
+
+    return score
 
 
-def assign_alignment_quality(en: str, ne: str, ratio_status: str) -> str:
-    """
-    Assigns a simple quality label for manual review.
-    """
+def skip_cost(text: str, lang: str) -> float:
+    if is_heading_like(text):
+        return 0.75
+
+    if is_too_short(text, lang):
+        return 1.0
+
+    if is_bullet_like(text):
+        return 2.0
+
+    return 2.25
+
+
+def assign_alignment_quality(en: str, ne: str, ratio_status: str, score: float) -> str:
     if is_too_short(en, "en") or is_too_short(ne, "ne"):
         return "needs_review_short"
 
@@ -73,155 +273,312 @@ def assign_alignment_quality(en: str, ne: str, ratio_status: str) -> str:
     if ratio_status == "bad":
         return "needs_review_length_mismatch"
 
-    if ratio_status == "warning":
+    if ratio_status == "warning" or score < 2.5:
         return "medium_confidence"
 
     return "high_confidence"
 
 
+def build_runs(records: list[dict]) -> list[dict]:
+    runs = []
+    current_run = None
+
+    for record in records:
+        language = record["language"]
+
+        if current_run and current_run["language"] == language:
+            current_run["records"].append(record)
+            continue
+
+        current_run = {
+            "language": language,
+            "records": [record],
+        }
+        runs.append(current_run)
+
+    return runs
+
+
+def pair_runs(runs: list[dict]) -> tuple[list[dict], int, int]:
+    run_pairs = []
+    unmatched_en = 0
+    unmatched_ne = 0
+    index = 0
+
+    while index < len(runs):
+        current = runs[index]
+        current_lang = current["language"]
+
+        if current_lang not in {"en", "ne"}:
+            index += 1
+            continue
+
+        if index + 1 >= len(runs):
+            if current_lang == "en":
+                unmatched_en += len(current["records"])
+            else:
+                unmatched_ne += len(current["records"])
+            index += 1
+            continue
+
+        nxt = runs[index + 1]
+        next_lang = nxt["language"]
+
+        if next_lang not in {"en", "ne"} or next_lang == current_lang:
+            if current_lang == "en":
+                unmatched_en += len(current["records"])
+            else:
+                unmatched_ne += len(current["records"])
+            index += 1
+            continue
+
+        if current_lang == "en":
+            run_pairs.append({"en": current["records"], "ne": nxt["records"]})
+        else:
+            run_pairs.append({"en": nxt["records"], "ne": current["records"]})
+
+        index += 2
+
+    return run_pairs, unmatched_en, unmatched_ne
+
+
+def align_run_sentences(en_records: list[dict], ne_records: list[dict]) -> tuple[list[tuple[int, int, float]], int, int]:
+    en_texts = [record["sentence"] for record in en_records]
+    ne_texts = [record["sentence"] for record in ne_records]
+
+    en_len = len(en_records)
+    ne_len = len(ne_records)
+
+    dp = [[0.0 for _ in range(ne_len + 1)] for _ in range(en_len + 1)]
+    choice = [[None for _ in range(ne_len + 1)] for _ in range(en_len + 1)]
+
+    for en_index in range(en_len - 1, -1, -1):
+        dp[en_index][ne_len] = dp[en_index + 1][ne_len] - skip_cost(en_texts[en_index], "en")
+        choice[en_index][ne_len] = "skip_en"
+
+    for ne_index in range(ne_len - 1, -1, -1):
+        dp[en_len][ne_index] = dp[en_len][ne_index + 1] - skip_cost(ne_texts[ne_index], "ne")
+        choice[en_len][ne_index] = "skip_ne"
+
+    for en_index in range(en_len - 1, -1, -1):
+        for ne_index in range(ne_len - 1, -1, -1):
+            match = pair_score(en_texts[en_index], ne_texts[ne_index]) + dp[en_index + 1][ne_index + 1]
+            skip_en_score = dp[en_index + 1][ne_index] - skip_cost(en_texts[en_index], "en")
+            skip_ne_score = dp[en_index][ne_index + 1] - skip_cost(ne_texts[ne_index], "ne")
+
+            best_score = match
+            best_choice = "match"
+
+            if skip_en_score > best_score:
+                best_score = skip_en_score
+                best_choice = "skip_en"
+
+            if skip_ne_score > best_score:
+                best_score = skip_ne_score
+                best_choice = "skip_ne"
+
+            dp[en_index][ne_index] = best_score
+            choice[en_index][ne_index] = best_choice
+
+    alignments = []
+    en_index = 0
+    ne_index = 0
+    unmatched_en = 0
+    unmatched_ne = 0
+
+    while en_index < en_len or ne_index < ne_len:
+        current_choice = choice[en_index][ne_index]
+
+        if current_choice == "match":
+            score = pair_score(en_texts[en_index], ne_texts[ne_index])
+            alignments.append((en_index, ne_index, score))
+            en_index += 1
+            ne_index += 1
+        elif current_choice == "skip_en":
+            unmatched_en += 1
+            en_index += 1
+        elif current_choice == "skip_ne":
+            unmatched_ne += 1
+            ne_index += 1
+        else:
+            break
+
+    return alignments, unmatched_en, unmatched_ne
+
+
 def main():
-    df = pd.read_csv(SENTENCE_CANDIDATES_PATH)
+    rows = read_csv_rows(SENTENCE_CANDIDATES_PATH)
 
-    required_columns = [
-        "global_sentence_id",
-        "source_id",
-        "title",
-        "subdomain",
-        "paragraph_id",
-        "local_sentence_id",
-        "language",
-        "sentence",
-    ]
-
-    missing = [col for col in required_columns if col not in df.columns]
+    missing = [column for column in INPUT_FIELDNAMES if column not in rows[0]] if rows else INPUT_FIELDNAMES
     if missing:
         raise ValueError(f"Missing columns in sentence_candidates.csv: {missing}")
 
-    # Keep only English and Nepali sentence candidates
-    df = df[df["language"].isin(["en", "ne"])].copy()
+    grouped_rows = {}
+    source_order = []
 
-    # Sort by document order
-    df = df.sort_values(
-        by=["source_id", "paragraph_id", "local_sentence_id", "global_sentence_id"]
-    )
+    for row in rows:
+        source_id = row["source_id"]
+
+        if source_id not in grouped_rows:
+            grouped_rows[source_id] = []
+            source_order.append(source_id)
+
+        grouped_rows[source_id].append(row)
 
     aligned_rows = []
+    manual_review_rows = []
     log_rows = []
-
     pair_counter = 1
 
-    for source_id, group in df.groupby("source_id"):
-        group = group.copy()
+    for source_id in source_order:
+        group = sorted(
+            grouped_rows[source_id],
+            key=lambda item: natural_sentence_id(item["global_sentence_id"]),
+        )
 
-        title = group["title"].iloc[0]
-        subdomain = group["subdomain"].iloc[0]
+        title = group[0]["title"]
+        subdomain = group[0]["subdomain"]
 
-        en_df = group[group["language"] == "en"].copy()
-        ne_df = group[group["language"] == "ne"].copy()
+        filtered_records = []
+        raw_en_count = 0
+        raw_ne_count = 0
 
-        en_df["sentence"] = en_df["sentence"].apply(clean_for_alignment)
-        ne_df["sentence"] = ne_df["sentence"].apply(clean_for_alignment)
+        for record in group:
+            language = record["language"]
+            sentence = strip_header_prefixes(record["sentence"], title)
 
-        en_df = en_df[en_df["sentence"].str.len() > 0]
-        ne_df = ne_df[ne_df["sentence"].str.len() > 0]
+            if language == "en":
+                raw_en_count += 1
+            elif language == "ne":
+                raw_ne_count += 1
 
-        num_en = len(en_df)
-        num_ne = len(ne_df)
-        num_pairs = min(num_en, num_ne)
+            if language not in {"en", "ne"}:
+                continue
+
+            if is_alignment_noise(sentence, language, title):
+                continue
+
+            normalized_record = dict(record)
+            normalized_record["sentence"] = sentence
+            filtered_records.append(normalized_record)
+
+        num_en = sum(1 for record in filtered_records if record["language"] == "en")
+        num_ne = sum(1 for record in filtered_records if record["language"] == "ne")
 
         print(f"\nAligning {source_id} - {title}")
-        print(f"EN: {num_en} | NE: {num_ne} | Pairs: {num_pairs}")
+        print(f"Filtered EN: {num_en} | Filtered NE: {num_ne}")
 
-        en_records = en_df.to_dict("records")
-        ne_records = ne_df.to_dict("records")
+        if num_en == 0 or num_ne == 0:
+            log_rows.append(
+                {
+                    "source_id": source_id,
+                    "title": title,
+                    "subdomain": subdomain,
+                    "num_en_sentences": raw_en_count,
+                    "num_ne_sentences": raw_ne_count,
+                    "num_aligned_pairs": 0,
+                    "num_unmatched_en": raw_en_count,
+                    "num_unmatched_ne": raw_ne_count,
+                    "num_run_pairs": 0,
+                    "alignment_status": "skipped_missing_parallel_language",
+                }
+            )
+            continue
 
-        for i in range(num_pairs):
-            en_row = en_records[i]
-            ne_row = ne_records[i]
+        runs = build_runs(filtered_records)
+        run_pairs, unmatched_en_runs, unmatched_ne_runs = pair_runs(runs)
 
-            en_text = en_row["sentence"]
-            ne_text = ne_row["sentence"]
+        aligned_count = 0
+        unmatched_en = unmatched_en_runs
+        unmatched_ne = unmatched_ne_runs
 
-            ratio, ratio_status = length_ratio_flag(en_text, ne_text)
-            quality = assign_alignment_quality(en_text, ne_text, ratio_status)
+        for run_pair in run_pairs:
+            run_alignments, run_unmatched_en, run_unmatched_ne = align_run_sentences(
+                run_pair["en"],
+                run_pair["ne"],
+            )
 
-            aligned_rows.append({
-                "pair_id": f"PAIR_{pair_counter:07d}",
+            unmatched_en += run_unmatched_en
+            unmatched_ne += run_unmatched_ne
+
+            for en_index, ne_index, score in run_alignments:
+                en_row = run_pair["en"][en_index]
+                ne_row = run_pair["ne"][ne_index]
+
+                en_text = en_row["sentence"]
+                ne_text = ne_row["sentence"]
+
+                ratio, ratio_status = length_ratio_flag(en_text, ne_text)
+                quality = assign_alignment_quality(en_text, ne_text, ratio_status, score)
+
+                aligned_row = {
+                    "pair_id": f"PAIR_{pair_counter:07d}",
+                    "source_id": source_id,
+                    "title": title,
+                    "subdomain": subdomain,
+                    "en_sentence_id": en_row["global_sentence_id"],
+                    "ne_sentence_id": ne_row["global_sentence_id"],
+                    "en_paragraph_id": en_row["paragraph_id"],
+                    "ne_paragraph_id": ne_row["paragraph_id"],
+                    "en": en_text,
+                    "ne": ne_text,
+                    "en_chars": len(en_text),
+                    "ne_chars": len(ne_text),
+                    "length_ratio_ne_en": round(ratio, 3),
+                    "length_ratio_status": ratio_status,
+                    "alignment_method": "language_run_dp_v1",
+                    "quality_label": quality,
+                    "review_status": "pending",
+                }
+
+                aligned_rows.append(aligned_row)
+                manual_review_rows.append(
+                    {
+                        "pair_id": aligned_row["pair_id"],
+                        "source_id": source_id,
+                        "title": title,
+                        "subdomain": subdomain,
+                        "en": en_text,
+                        "ne": ne_text,
+                        "quality_label": quality,
+                        "length_ratio_status": ratio_status,
+                        "review_status": "pending",
+                        "corrected_en": "",
+                        "corrected_ne": "",
+                        "review_notes": "",
+                    }
+                )
+
+                pair_counter += 1
+                aligned_count += 1
+
+        status = "aligned_runwise"
+        if unmatched_en or unmatched_ne:
+            status = "aligned_with_unmatched_sentences"
+
+        log_rows.append(
+            {
                 "source_id": source_id,
                 "title": title,
                 "subdomain": subdomain,
+                "num_en_sentences": raw_en_count,
+                "num_ne_sentences": raw_ne_count,
+                "num_aligned_pairs": aligned_count,
+                "num_unmatched_en": unmatched_en,
+                "num_unmatched_ne": unmatched_ne,
+                "num_run_pairs": len(run_pairs),
+                "alignment_status": status,
+            }
+        )
 
-                "en_sentence_id": en_row["global_sentence_id"],
-                "ne_sentence_id": ne_row["global_sentence_id"],
-
-                "en_paragraph_id": en_row["paragraph_id"],
-                "ne_paragraph_id": ne_row["paragraph_id"],
-
-                "en": en_text,
-                "ne": ne_text,
-
-                "en_chars": len(en_text),
-                "ne_chars": len(ne_text),
-                "length_ratio_ne_en": round(ratio, 3),
-                "length_ratio_status": ratio_status,
-
-                "alignment_method": "sequential_order_baseline",
-                "quality_label": quality,
-                "review_status": "pending"
-            })
-
-            pair_counter += 1
-
-        log_rows.append({
-            "source_id": source_id,
-            "title": title,
-            "subdomain": subdomain,
-            "num_en_sentences": num_en,
-            "num_ne_sentences": num_ne,
-            "num_aligned_pairs": num_pairs,
-            "num_unmatched_en": max(num_en - num_ne, 0),
-            "num_unmatched_ne": max(num_ne - num_en, 0),
-            "alignment_status": "aligned_first_pass"
-        })
-
-    aligned_df = pd.DataFrame(aligned_rows)
-    log_df = pd.DataFrame(log_rows)
-
-    ALIGNED_OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    ALIGNMENT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-    aligned_df.to_csv(ALIGNED_OUTPUT_PATH, index=False)
-    log_df.to_csv(ALIGNMENT_LOG_PATH, index=False)
-
-    # Create manual review file
-    manual_review_df = aligned_df[
-        [
-            "pair_id",
-            "source_id",
-            "title",
-            "subdomain",
-            "en",
-            "ne",
-            "quality_label",
-            "length_ratio_status",
-            "review_status",
-        ]
-    ].copy()
-
-    manual_review_df["corrected_en"] = ""
-    manual_review_df["corrected_ne"] = ""
-    manual_review_df["review_notes"] = ""
-
-    manual_review_df.to_csv(MANUAL_REVIEW_OUTPUT_PATH, index=False)
+    write_csv_rows(ALIGNED_OUTPUT_PATH, ALIGNED_FIELDNAMES, aligned_rows)
+    write_csv_rows(MANUAL_REVIEW_OUTPUT_PATH, MANUAL_REVIEW_FIELDNAMES, manual_review_rows)
+    write_csv_rows(ALIGNMENT_LOG_PATH, LOG_FIELDNAMES, log_rows)
 
     print("\nAlignment complete.")
     print(f"Raw aligned pairs saved to: {ALIGNED_OUTPUT_PATH}")
     print(f"Manual review template saved to: {MANUAL_REVIEW_OUTPUT_PATH}")
     print(f"Alignment log saved to: {ALIGNMENT_LOG_PATH}")
-
-    if not aligned_df.empty:
-        print("\nQuality label counts:")
-        print(aligned_df["quality_label"].value_counts())
 
 
 if __name__ == "__main__":
