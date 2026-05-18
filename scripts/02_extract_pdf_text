@@ -1,0 +1,109 @@
+import fitz
+import pandas as pd
+from pathlib import Path
+
+
+DOWNLOAD_LOG_PATH = Path("data/logs/download_log.csv")
+EXTRACTED_DIR = Path("data/extracted/text")
+EXTRACTION_LOG_PATH = Path("data/logs/extraction_log.csv")
+
+
+def extract_text_from_pdf(pdf_path: Path) -> tuple[str, int]:
+    doc = fitz.open(pdf_path)
+
+    pages = []
+
+    for page_num, page in enumerate(doc, start=1):
+        text = page.get_text("text")
+        pages.append(f"\n\n--- PAGE {page_num} ---\n\n{text}")
+
+    full_text = "\n".join(pages)
+    return full_text, len(doc)
+
+
+def main():
+    df = pd.read_csv(DOWNLOAD_LOG_PATH)
+
+    logs = []
+
+    for index, row in df.iterrows():
+        source_id = row["source_id"]
+        title = row["title"]
+        subdomain = row["subdomain"]
+        local_path = Path(row["local_path"])
+        download_status = row["download_status"]
+
+        print(f"\n[{index + 1}/{len(df)}] Extracting: {source_id} - {title}")
+
+        if download_status not in ["downloaded", "already_downloaded"]:
+            logs.append({
+                "source_id": source_id,
+                "title": title,
+                "subdomain": subdomain,
+                "pdf_path": str(local_path),
+                "text_path": "",
+                "num_pages": 0,
+                "num_chars": 0,
+                "extraction_status": "skipped_not_downloaded"
+            })
+            continue
+
+        if not local_path.exists():
+            logs.append({
+                "source_id": source_id,
+                "title": title,
+                "subdomain": subdomain,
+                "pdf_path": str(local_path),
+                "text_path": "",
+                "num_pages": 0,
+                "num_chars": 0,
+                "extraction_status": "failed_pdf_not_found"
+            })
+            continue
+
+        try:
+            text, num_pages = extract_text_from_pdf(local_path)
+
+            output_dir = EXTRACTED_DIR / subdomain
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+            text_path = output_dir / f"{source_id}.txt"
+
+            with open(text_path, "w", encoding="utf-8") as f:
+                f.write(text)
+
+            logs.append({
+                "source_id": source_id,
+                "title": title,
+                "subdomain": subdomain,
+                "pdf_path": str(local_path),
+                "text_path": str(text_path),
+                "num_pages": num_pages,
+                "num_chars": len(text),
+                "extraction_status": "extracted"
+            })
+
+            print(f"Extracted to: {text_path}")
+
+        except Exception as e:
+            logs.append({
+                "source_id": source_id,
+                "title": title,
+                "subdomain": subdomain,
+                "pdf_path": str(local_path),
+                "text_path": "",
+                "num_pages": 0,
+                "num_chars": 0,
+                "extraction_status": f"failed:{type(e).__name__}:{e}"
+            })
+
+    log_df = pd.DataFrame(logs)
+    EXTRACTION_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    log_df.to_csv(EXTRACTION_LOG_PATH, index=False)
+
+    print("\nExtraction complete.")
+    print(f"Extraction log saved to: {EXTRACTION_LOG_PATH}")
+
+
+if __name__ == "__main__":
+    main()
