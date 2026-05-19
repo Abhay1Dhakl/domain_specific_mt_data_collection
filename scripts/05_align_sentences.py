@@ -100,20 +100,43 @@ def count_latin(text: str) -> int:
     return len(re.findall(r"[A-Za-z]", text))
 
 
+def normalize_comparison_text(text: str) -> str:
+    text = str(text)
+    text = text.replace("’", "'")
+    text = text.replace("‘", "'")
+    text = text.replace("“", '"')
+    text = text.replace("”", '"')
+    text = text.replace("ﬁ", "fi")
+    text = text.replace("ﬂ", "fl")
+    text = text.lower()
+    text = re.sub(r"\s+", " ", text)
+    return text.strip(" .:-")
+
+
 def clean_for_alignment(text: str) -> str:
     text = str(text).replace("Ì", "")
     text = text.replace("�", "")
+    text = text.replace("ﬁ", "fi")
+    text = text.replace("ﬂ", "fl")
     text = re.sub(r"[\uE000-\uF8FF]", "", text)
-    text = re.sub(r"([।.!?])(?=[^\s])", r"\1 ", text)
+    text = re.sub(r"([।.!?ः])(?=[^\s])", r"\1 ", text)
     text = text.strip()
     text = re.sub(r"\s+", " ", text)
     text = re.sub(r"•\s+", "• ", text)
     return text
 
 
+def is_urlish_fragment(text: str) -> bool:
+    lower = str(text).lower()
+    if not any(token in lower for token in ["www.", ".gov", "cdc.", "immunize.", "vaccineinformation."]):
+        return False
+
+    return len(str(text).split()) <= 10
+
+
 def strip_header_prefixes(text: str, title: str) -> str:
     text = clean_for_alignment(text)
-    title_pattern = re.escape(title)
+    title_pattern = re.escape(clean_for_alignment(title))
 
     patterns = [
         rf"^\d+\s+{title_pattern}\.?\s+Nepali\.?\s*",
@@ -144,7 +167,7 @@ def is_heading_like(text: str) -> bool:
     if text.startswith("•"):
         return False
 
-    if len(text.split()) <= 8 and not re.search(r"[।.!?:]$", text):
+    if len(text.split()) <= 8 and not re.search(r"[।.!?:ः]$", text):
         return True
 
     return False
@@ -154,6 +177,7 @@ def is_alignment_noise(text: str, lang: str, title: str) -> bool:
     text = strip_header_prefixes(text, title)
     lower = text.lower()
     word_count = len(text.replace("•", " ").split())
+    title_lower = normalize_comparison_text(title)
 
     if not text:
         return True
@@ -161,7 +185,7 @@ def is_alignment_noise(text: str, lang: str, title: str) -> bool:
     if re.fullmatch(r"\d+", text):
         return True
 
-    if lower in {title.lower(), f"{title.lower()}.", "nepali."}:
+    if normalize_comparison_text(text) in {title_lower, "nepali"}:
         return True
 
     if "healthinfotranslations.org" in lower:
@@ -173,10 +197,12 @@ def is_alignment_noise(text: str, lang: str, title: str) -> bool:
     if any(
         phrase in lower
         for phrase in [
+            "©",
             "copyright",
             "unless otherwise stated",
             "the medical information found on this website",
             "you should always seek the advice of your doctor",
+            "a result of your stopping medical treatment",
             "the ohio state university",
             "wexner medical center",
             "mount carmel health system",
@@ -186,7 +212,10 @@ def is_alignment_noise(text: str, lang: str, title: str) -> bool:
     ):
         return True
 
-    if word_count <= 12 and not text.startswith("•") and not re.search(r"[।.!?:]$", text):
+    if is_urlish_fragment(text):
+        return True
+
+    if word_count <= 12 and not text.startswith("•") and not re.search(r"[।.!?:ः]$", text):
         return True
 
     if lang == "en" and count_latin(text) < 3:
@@ -261,6 +290,31 @@ def skip_cost(text: str, lang: str) -> float:
         return 2.0
 
     return 2.25
+
+
+def combined_text(records: list[dict], start: int, size: int) -> str:
+    return " ".join(record["sentence"] for record in records[start:start + size]).strip()
+
+
+def span_pair_score(en_records: list[dict], en_index: int, en_size: int, ne_records: list[dict], ne_index: int, ne_size: int) -> float:
+    en_text = combined_text(en_records, en_index, en_size)
+    ne_text = combined_text(ne_records, ne_index, ne_size)
+    penalty = 0.4 * max(0, (en_size + ne_size) - 2)
+    return pair_score(en_text, ne_text) - penalty
+
+
+def can_use_multi_span(records: list[dict], start: int, size: int, lang: str) -> bool:
+    if size <= 1:
+        return True
+
+    for record in records[start:start + size]:
+        text = record["sentence"]
+        if is_too_short(text, lang) or is_heading_like(text) or is_urlish_fragment(text):
+            return True
+        if is_bullet_like(text) and len(text.replace("•", " ").split()) <= 6:
+            return True
+
+    return False
 
 
 def assign_alignment_quality(en: str, ne: str, ratio_status: str, score: float) -> str:
@@ -342,10 +396,7 @@ def pair_runs(runs: list[dict]) -> tuple[list[dict], int, int]:
     return run_pairs, unmatched_en, unmatched_ne
 
 
-def align_run_sentences(en_records: list[dict], ne_records: list[dict]) -> tuple[list[tuple[int, int, float]], int, int]:
-    en_texts = [record["sentence"] for record in en_records]
-    ne_texts = [record["sentence"] for record in ne_records]
-
+def align_run_sentences(en_records: list[dict], ne_records: list[dict]) -> tuple[list[dict], int, int]:
     en_len = len(en_records)
     ne_len = len(ne_records)
 
@@ -353,29 +404,49 @@ def align_run_sentences(en_records: list[dict], ne_records: list[dict]) -> tuple
     choice = [[None for _ in range(ne_len + 1)] for _ in range(en_len + 1)]
 
     for en_index in range(en_len - 1, -1, -1):
-        dp[en_index][ne_len] = dp[en_index + 1][ne_len] - skip_cost(en_texts[en_index], "en")
+        dp[en_index][ne_len] = dp[en_index + 1][ne_len] - skip_cost(en_records[en_index]["sentence"], "en")
         choice[en_index][ne_len] = "skip_en"
 
     for ne_index in range(ne_len - 1, -1, -1):
-        dp[en_len][ne_index] = dp[en_len][ne_index + 1] - skip_cost(ne_texts[ne_index], "ne")
+        dp[en_len][ne_index] = dp[en_len][ne_index + 1] - skip_cost(ne_records[ne_index]["sentence"], "ne")
         choice[en_len][ne_index] = "skip_ne"
 
     for en_index in range(en_len - 1, -1, -1):
         for ne_index in range(ne_len - 1, -1, -1):
-            match = pair_score(en_texts[en_index], ne_texts[ne_index]) + dp[en_index + 1][ne_index + 1]
-            skip_en_score = dp[en_index + 1][ne_index] - skip_cost(en_texts[en_index], "en")
-            skip_ne_score = dp[en_index][ne_index + 1] - skip_cost(ne_texts[ne_index], "ne")
+            options = []
 
-            best_score = match
-            best_choice = "match"
+            options.append(
+                (
+                    span_pair_score(en_records, en_index, 1, ne_records, ne_index, 1)
+                    + dp[en_index + 1][ne_index + 1],
+                    ("match", 1, 1),
+                )
+            )
 
-            if skip_en_score > best_score:
-                best_score = skip_en_score
-                best_choice = "skip_en"
+            if ne_index + 1 < ne_len and can_use_multi_span(ne_records, ne_index, 2, "ne"):
+                options.append(
+                    (
+                        span_pair_score(en_records, en_index, 1, ne_records, ne_index, 2)
+                        + dp[en_index + 1][ne_index + 2],
+                        ("match", 1, 2),
+                    )
+                )
 
-            if skip_ne_score > best_score:
-                best_score = skip_ne_score
-                best_choice = "skip_ne"
+            if en_index + 1 < en_len and can_use_multi_span(en_records, en_index, 2, "en"):
+                options.append(
+                    (
+                        span_pair_score(en_records, en_index, 2, ne_records, ne_index, 1)
+                        + dp[en_index + 2][ne_index + 1],
+                        ("match", 2, 1),
+                    )
+                )
+
+            skip_en_score = dp[en_index + 1][ne_index] - skip_cost(en_records[en_index]["sentence"], "en")
+            skip_ne_score = dp[en_index][ne_index + 1] - skip_cost(ne_records[ne_index]["sentence"], "ne")
+            options.append((skip_en_score, "skip_en"))
+            options.append((skip_ne_score, "skip_ne"))
+
+            best_score, best_choice = max(options, key=lambda item: item[0])
 
             dp[en_index][ne_index] = best_score
             choice[en_index][ne_index] = best_choice
@@ -389,11 +460,20 @@ def align_run_sentences(en_records: list[dict], ne_records: list[dict]) -> tuple
     while en_index < en_len or ne_index < ne_len:
         current_choice = choice[en_index][ne_index]
 
-        if current_choice == "match":
-            score = pair_score(en_texts[en_index], ne_texts[ne_index])
-            alignments.append((en_index, ne_index, score))
-            en_index += 1
-            ne_index += 1
+        if isinstance(current_choice, tuple) and current_choice[0] == "match":
+            _, en_size, ne_size = current_choice
+            score = span_pair_score(en_records, en_index, en_size, ne_records, ne_index, ne_size)
+            alignments.append(
+                {
+                    "en_start": en_index,
+                    "en_size": en_size,
+                    "ne_start": ne_index,
+                    "ne_size": ne_size,
+                    "score": score,
+                }
+            )
+            en_index += en_size
+            ne_index += ne_size
         elif current_choice == "skip_en":
             unmatched_en += 1
             en_index += 1
@@ -501,32 +581,34 @@ def main():
             unmatched_en += run_unmatched_en
             unmatched_ne += run_unmatched_ne
 
-            for en_index, ne_index, score in run_alignments:
-                en_row = run_pair["en"][en_index]
-                ne_row = run_pair["ne"][ne_index]
+            for alignment in run_alignments:
+                en_slice = run_pair["en"][alignment["en_start"]:alignment["en_start"] + alignment["en_size"]]
+                ne_slice = run_pair["ne"][alignment["ne_start"]:alignment["ne_start"] + alignment["ne_size"]]
 
-                en_text = en_row["sentence"]
-                ne_text = ne_row["sentence"]
+                en_text = " ".join(row["sentence"] for row in en_slice)
+                ne_text = " ".join(row["sentence"] for row in ne_slice)
+                score = alignment["score"]
 
                 ratio, ratio_status = length_ratio_flag(en_text, ne_text)
                 quality = assign_alignment_quality(en_text, ne_text, ratio_status, score)
+                method_suffix = f"{len(en_slice)}x{len(ne_slice)}"
 
                 aligned_row = {
                     "pair_id": f"PAIR_{pair_counter:07d}",
                     "source_id": source_id,
                     "title": title,
                     "subdomain": subdomain,
-                    "en_sentence_id": en_row["global_sentence_id"],
-                    "ne_sentence_id": ne_row["global_sentence_id"],
-                    "en_paragraph_id": en_row["paragraph_id"],
-                    "ne_paragraph_id": ne_row["paragraph_id"],
+                    "en_sentence_id": "|".join(row["global_sentence_id"] for row in en_slice),
+                    "ne_sentence_id": "|".join(row["global_sentence_id"] for row in ne_slice),
+                    "en_paragraph_id": "|".join(row["paragraph_id"] for row in en_slice),
+                    "ne_paragraph_id": "|".join(row["paragraph_id"] for row in ne_slice),
                     "en": en_text,
                     "ne": ne_text,
                     "en_chars": len(en_text),
                     "ne_chars": len(ne_text),
                     "length_ratio_ne_en": round(ratio, 3),
                     "length_ratio_status": ratio_status,
-                    "alignment_method": "language_run_dp_v1",
+                    "alignment_method": f"language_run_dp_v2_{method_suffix}",
                     "quality_label": quality,
                     "review_status": "pending",
                 }

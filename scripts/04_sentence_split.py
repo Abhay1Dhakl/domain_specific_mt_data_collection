@@ -33,7 +33,7 @@ LOG_FIELDNAMES = [
     "status",
 ]
 
-BULLET_CHARS = "•◦▪●·"
+BULLET_CHARS = "•◦▪●·▸►‣"
 FIGURE_LABEL_PATTERNS = [
     "retinal blood vessels",
     "back of eye",
@@ -70,6 +70,12 @@ def normalize_line(line: str) -> str:
     line = line.replace("▪", "•")
     line = line.replace("●", "•")
     line = line.replace("·", "•")
+    line = line.replace("▸", "•")
+    line = line.replace("►", "•")
+    line = line.replace("‣", "•")
+    line = line.replace("", "•")
+    line = line.replace("ﬁ", "fi")
+    line = line.replace("ﬂ", "fl")
     line = re.sub(r"\s+", " ", line)
     return line.strip()
 
@@ -90,6 +96,30 @@ def dedupe_consecutive_lines(lines: list[str]) -> list[str]:
     return deduped
 
 
+def sentence_terminal(text: str) -> bool:
+    return bool(re.search(r"[।.!?:ः]$", text))
+
+
+def normalize_comparison_text(text: str) -> str:
+    text = str(text)
+    text = text.replace("’", "'")
+    text = text.replace("‘", "'")
+    text = text.replace("“", '"')
+    text = text.replace("”", '"')
+    text = text.replace("ﬁ", "fi")
+    text = text.replace("ﬂ", "fl")
+    text = text.lower()
+    text = re.sub(r"\s+", " ", text)
+    return text.strip(" .:-")
+
+
+def normalize_header_text(text: str) -> str:
+    text = normalize_comparison_text(text)
+    text = text.replace(".", "")
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
 def drop_short_label_runs(lines: list[str]) -> list[str]:
     """
     Remove dense runs of short, punctuation-free label lines.
@@ -102,8 +132,14 @@ def drop_short_label_runs(lines: list[str]) -> list[str]:
         nonlocal run
 
         if len(run) >= 4:
-            run = []
-            return
+            word_counts = [len(item.split()) for item in run]
+            average_words = sum(word_counts) / len(word_counts)
+
+            # Drop only very compact label stacks. Wrapped body text often appears
+            # as several short lines as well, but it usually averages 3-4 words.
+            if average_words <= 2.5 and max(word_counts) <= 3:
+                run = []
+                return
 
         kept.extend(run)
         run = []
@@ -118,7 +154,7 @@ def drop_short_label_runs(lines: list[str]) -> list[str]:
         looks_like_label = (
             not is_bullet_marker_only(line)
             and not sentence_terminal(line)
-            and 1 <= word_count <= 4
+            and 1 <= word_count <= 3
         )
 
         if looks_like_label:
@@ -172,6 +208,10 @@ def is_bullet_marker_only(line: str) -> bool:
     return bool(re.fullmatch(rf"[{re.escape(BULLET_CHARS)}]+", line))
 
 
+def starts_numbered_step(line: str) -> bool:
+    return bool(re.match(r"^\d+\.", line))
+
+
 def normalize_bullet_line(line: str) -> str:
     content = line.lstrip(BULLET_CHARS).strip()
     return f"• {content}" if content else "•"
@@ -181,11 +221,13 @@ def is_disclaimer_line(line: str) -> bool:
     lower = line.lower()
 
     disclaimer_patterns = [
+        "©",
         "healthinfotranslations.org",
         "copyright",
         "unless otherwise stated",
         "the medical information found on this website",
         "you should always seek the advice of your doctor",
+        "a result of your stopping medical treatment",
         "the ohio state university",
         "wexner medical center",
         "mount carmel health system",
@@ -196,6 +238,14 @@ def is_disclaimer_line(line: str) -> bool:
     return any(pattern in lower for pattern in disclaimer_patterns)
 
 
+def is_urlish_fragment(text: str) -> bool:
+    lower = str(text).lower()
+    if not any(token in lower for token in ["www.", ".gov", "cdc.", "immunize.", "vaccineinformation."]):
+        return False
+
+    return len(str(text).split()) <= 10
+
+
 def strip_leading_page_number(line: str) -> str:
     return re.sub(r"^\d+\s+", "", line).strip()
 
@@ -204,11 +254,14 @@ def should_skip_line(line: str, title: str) -> bool:
     if not line:
         return True
 
-    lower = line.lower()
-    title_lower = title.lower()
-    stripped_page = strip_leading_page_number(lower)
+    lower = normalize_comparison_text(line)
+    header_lower = normalize_header_text(line)
+    title_lower = normalize_comparison_text(title)
+    title_header = normalize_header_text(title)
+    stripped_page = normalize_comparison_text(strip_leading_page_number(line))
+    stripped_page_header = normalize_header_text(strip_leading_page_number(line))
 
-    if lower in {"nepali.", "healthinfotranslations.org"}:
+    if lower in {"nepali", "healthinfotranslations.org"}:
         return True
 
     if re.fullmatch(r"\d+", line):
@@ -220,7 +273,13 @@ def should_skip_line(line: str, title: str) -> bool:
     if lower == f"{title_lower}. nepali.":
         return True
 
+    if header_lower in {title_header, f"{title_header} nepali"}:
+        return True
+
     if stripped_page in {title_lower, f"{title_lower}.", f"{title_lower}. nepali.", "healthinfotranslations.org"}:
+        return True
+
+    if stripped_page_header in {title_header, f"{title_header} nepali"}:
         return True
 
     if is_disclaimer_line(line):
@@ -230,14 +289,16 @@ def should_skip_line(line: str, title: str) -> bool:
 
 
 def sentence_terminal(text: str) -> bool:
-    return bool(re.search(r"[।.!?:]$", text))
+    return bool(re.search(r"[।.!?:ः]$", text))
 
 
 def clean_sentence_text(sentence: str) -> str:
     sentence = sentence.replace("Ì", "")
     sentence = sentence.replace("�", "")
+    sentence = sentence.replace("ﬁ", "fi")
+    sentence = sentence.replace("ﬂ", "fl")
     sentence = re.sub(r"[\uE000-\uF8FF]", "", sentence)
-    sentence = re.sub(r"([।.!?])(?=[^\s])", r"\1 ", sentence)
+    sentence = re.sub(r"([।.!?ः])(?=[^\s])", r"\1 ", sentence)
     sentence = re.sub(r"\s+", " ", sentence)
     sentence = re.sub(r"•\s+", "• ", sentence)
     sentence = collapse_adjacent_duplicate_tokens(sentence)
@@ -283,13 +344,18 @@ def is_noise_sentence(sentence: str, lang: str, title: str) -> bool:
     if len(sentence) < 3:
         return True
 
-    if lower in {title.lower(), f"{title.lower()}.", "nepali."}:
+    title_lower = normalize_comparison_text(title)
+
+    if normalize_comparison_text(sentence) in {title_lower, "nepali"}:
         return True
 
     if re.fullmatch(r"\d+", sentence):
         return True
 
     if is_disclaimer_line(sentence):
+        return True
+
+    if is_urlish_fragment(sentence):
         return True
 
     if any(pattern in lower for pattern in FIGURE_LABEL_PATTERNS):
@@ -311,8 +377,13 @@ def is_noise_sentence(sentence: str, lang: str, title: str) -> bool:
 
 
 def split_text_block(block_text: str, is_bullet: bool) -> list[str]:
-    parts = re.split(r"(?<=[।.!?])\s+", block_text)
-    parts = [part.strip() for part in parts if part.strip()]
+    block_text = re.sub(
+        r"(^|\s)(\d+)\.(?=\s+[A-Za-z\u0900-\u097F])",
+        lambda match: f"{match.group(1)}{match.group(2)}<STEPDOT>",
+        block_text,
+    )
+    parts = re.split(r"(?<=[।.!?:ः])\s+", block_text)
+    parts = [part.replace("<STEPDOT>", ".").strip() for part in parts if part.strip()]
 
     if not is_bullet:
         return parts
@@ -369,6 +440,11 @@ def build_sentence_blocks(text: str, title: str) -> list[dict]:
             pending_bullet = False
             continue
 
+        if re.fullmatch(r"\d+", raw_line):
+            if current_lines and not sentence_terminal(current_lines[-1]):
+                current_lines.append(raw_line)
+                continue
+
         if should_skip_line(raw_line, title):
             flush_current()
             pending_bullet = False
@@ -391,6 +467,7 @@ def build_sentence_blocks(text: str, title: str) -> list[dict]:
             line_is_bullet = True
 
         line_lang = detect_language(line)
+        line_is_numbered_step = starts_numbered_step(line)
 
         if current_lines:
             strong_language_switch = (
@@ -403,6 +480,8 @@ def build_sentence_blocks(text: str, title: str) -> list[dict]:
             current_ended = sentence_terminal(current_text)
 
             if line_is_bullet:
+                flush_current()
+            elif line_is_numbered_step:
                 flush_current()
             elif strong_language_switch:
                 flush_current()
